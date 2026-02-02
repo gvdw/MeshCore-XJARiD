@@ -22,11 +22,10 @@ public:
   }
 
   void release() {
-    if (_claims == 0) return; // avoid negative _claims
-
-    _claims--;
     if (_claims == 0) {
       digitalWrite(_pin, !_active);
+    } else {
+      _claims--;
     }
   }
 };
