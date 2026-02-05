@@ -139,8 +139,11 @@ MQTTBridge::MQTTBridge(NodePrefs *prefs, mesh::PacketManager *mgr, mesh::RTCCloc
               _analyzer_us_enabled(false), _analyzer_eu_enabled(false), _identity(identity),
               _analyzer_us_client(nullptr), _analyzer_eu_client(nullptr), _config_valid(false),
               _cached_has_brokers(false), _cached_has_analyzer_servers(false),
-              _last_memory_check(0), _skipped_publishes(0),
-              _last_no_broker_log(0), _last_config_warning(0), _dispatcher(nullptr), _radio(nullptr), _board(nullptr), _ms(nullptr)
+              _last_memory_check(0), _skipped_publishes(0), _last_fragmentation_recovery(0),
+              _last_no_broker_log(0), _last_config_warning(0), _dispatcher(nullptr), _radio(nullptr), _board(nullptr), _ms(nullptr),
+              _last_wifi_check(0), _last_wifi_status(WL_DISCONNECTED), _wifi_status_initialized(false),
+              _wifi_disconnected_time(0), _last_wifi_reconnect_attempt(0), _wifi_reconnect_backoff_attempt(0),
+              _main_broker_reconnect_backoff_attempt(0), _analyzer_us_reconnect_backoff_attempt(0), _analyzer_eu_reconnect_backoff_attempt(0)
 #ifdef ESP_PLATFORM
               , _packet_queue_handle(nullptr), _mqtt_task_handle(nullptr), _raw_data_mutex(nullptr), _mqtt_task_stack(nullptr), _packet_queue_storage(nullptr)
 #else
@@ -335,6 +338,7 @@ void MQTTBridge::begin() {
     optimizeMqttClientConfig(_mqtt_client, false);
     _mqtt_client->onConnect([this](bool sessionPresent) {
       MQTT_DEBUG_PRINTLN("MQTT broker connected");
+      _main_broker_reconnect_backoff_attempt = 0;
       for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
         if (_brokers[i].enabled && !_brokers[i].connected) {
           _brokers[i].connected = true;
@@ -423,6 +427,7 @@ void MQTTBridge::begin() {
     optimizeMqttClientConfig(_mqtt_client, false);
     _mqtt_client->onConnect([this](bool sessionPresent) {
       MQTT_DEBUG_PRINTLN("MQTT broker connected");
+      _main_broker_reconnect_backoff_attempt = 0;
       for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
         if (_brokers[i].enabled && !_brokers[i].connected) {
           _brokers[i].connected = true;
@@ -633,88 +638,9 @@ void MQTTBridge::mqttTaskLoop() {
     // #endregion
     #endif
     
-    // Actively monitor and manage WiFi connection
-    static unsigned long last_wifi_check = 0;
-    static unsigned long last_wifi_reconnect_attempt = 0;
-    static wl_status_t last_wifi_status = WL_DISCONNECTED;
-    static bool wifi_status_initialized = false;
-    static unsigned long wifi_disconnected_time = 0;
-    
     unsigned long now = millis();
-    wl_status_t current_wifi_status = WiFi.status();
-    
-    // Backfill WiFi connect time when already connected (e.g. boot with WiFi up) so get wifi.status shows uptime
-    if (current_wifi_status == WL_CONNECTED && s_wifi_connected_at == 0) {
-      s_wifi_connected_at = millis();
-    }
-    
-    // Initialize last_wifi_status on first loop() call
-    if (!wifi_status_initialized) {
-      last_wifi_status = current_wifi_status;
-      wifi_status_initialized = true;
-      // Don't sync here - let the pending flag or transition handler do it
-    }
-    
-    // Check WiFi status every 10 seconds for faster detection
-    if (now - last_wifi_check > 10000) {
-      last_wifi_check = now;
-      
-      if (current_wifi_status == WL_CONNECTED) {
-        if (last_wifi_status != WL_CONNECTED) {
-          wifi_disconnected_time = 0;
-          s_wifi_connected_at = millis();
-          // Configure WiFi power management for efficient operation
-          wifi_ps_type_t ps_mode;
-          uint8_t ps_pref = _prefs->wifi_power_save;
-          if (ps_pref == 1) {
-            ps_mode = WIFI_PS_NONE;
-          } else if (ps_pref == 2) {
-            ps_mode = WIFI_PS_MAX_MODEM;
-          } else {
-            ps_mode = WIFI_PS_MIN_MODEM;
-          }
-          esp_wifi_set_ps(ps_mode);
-          
-          // Set WiFi TX power
-          #ifdef MQTT_WIFI_TX_POWER
-          WiFi.setTxPower(MQTT_WIFI_TX_POWER);
-          #else
-          WiFi.setTxPower(WIFI_POWER_11dBm);
-          #endif
-          
-          // NTP sync will be handled by _ntp_sync_pending flag from WiFi event handler
-          // This prevents multiple simultaneous syncs
-        }
-        // If already connected but we never recorded connect time (e.g. boot with WiFi up), set it now
-        if (s_wifi_connected_at == 0) {
-          s_wifi_connected_at = millis();
-        }
-        last_wifi_status = WL_CONNECTED;
-      } else {
-        if (last_wifi_status == WL_CONNECTED) {
-          wifi_disconnected_time = now;
-          s_wifi_connected_at = 0;
-          // Explicitly stop analyzer MQTT clients so ESP-IDF frees their buffers (it does not free on WiFi drop)
-          if (_analyzer_us_client) {
-            _analyzer_us_client->disconnect();
-          }
-          if (_analyzer_eu_client) {
-            _analyzer_eu_client->disconnect();
-          }
-        } else if (wifi_disconnected_time > 0) {
-          unsigned long disconnected_duration = now - wifi_disconnected_time;
-          
-          // Try to force reconnection if disconnected for more than 30 seconds
-          if (disconnected_duration > 30000 && (now - last_wifi_reconnect_attempt) > 30000) {
-            last_wifi_reconnect_attempt = now;
-            WiFi.disconnect();
-            WiFi.begin(_prefs->wifi_ssid, _prefs->wifi_password);
-          }
-        }
-        last_wifi_status = current_wifi_status;
-      }
-    }
-    
+    handleWiFiConnection(now);
+
     // Check for pending NTP sync (triggered from WiFi event handler)
     if (_ntp_sync_pending && WiFi.status() == WL_CONNECTED) {
       _ntp_sync_pending = false;
@@ -807,6 +733,13 @@ void MQTTBridge::mqttTaskLoop() {
             _last_status_publish = now;
             _last_status_retry = 0;
             MQTT_DEBUG_PRINTLN("Status published successfully, next publish in %lu ms", _status_interval);
+            // If we're in the hole but just proved connectivity, recover sooner than the 15-min critical check
+            size_t max_alloc = ESP.getMaxAllocHeap();
+            if (max_alloc < 58000 && (now - _last_fragmentation_recovery) > 300000) {
+              _last_fragmentation_recovery = now;
+              MQTT_DEBUG_PRINTLN("Fragmentation recovery after status (max_alloc=%d)", (int)max_alloc);
+              recreateMqttClientsForFragmentationRecovery();
+            }
           } else {
             MQTT_DEBUG_PRINTLN("Status publish failed, will retry in %lu ms", STATUS_RETRY_INTERVAL);
             // _last_status_retry already set above - will prevent immediate retry
@@ -817,7 +750,6 @@ void MQTTBridge::mqttTaskLoop() {
     
     // Critical memory check (every 15 minutes) - log warnings and run fragmentation recovery on ESP32
     static unsigned long last_critical_check = 0;
-    static unsigned long last_fragmentation_recovery = 0;
     if (now - last_critical_check > 900000) {
       size_t free_h = ESP.getFreeHeap();
       size_t max_alloc = ESP.getMaxAllocHeap();
@@ -842,8 +774,8 @@ void MQTTBridge::mqttTaskLoop() {
       int n_eu = (_analyzer_eu_client != nullptr) ? 1 : 0;
       MQTT_DEBUG_PRINTLN("MQTT clients active: %d (main=%d us=%d eu=%d)", n_main + n_us + n_eu, n_main, n_us, n_eu);
       // Proactive fragmentation recovery: recreate MQTT clients to recover max_alloc. Throttle once per 5 min.
-      if (max_alloc < 58000 && (now - last_fragmentation_recovery) > 300000) {
-        last_fragmentation_recovery = now;
+      if (max_alloc < 58000 && (now - _last_fragmentation_recovery) > 300000) {
+        _last_fragmentation_recovery = now;
         MQTT_DEBUG_PRINTLN("Fragmentation recovery: recreating MQTT clients (max_alloc=%d)", (int)max_alloc);
         recreateMqttClientsForFragmentationRecovery();
       }
@@ -925,6 +857,82 @@ void MQTTBridge::checkConfigurationMismatch() {
   }
 }
 
+bool MQTTBridge::handleWiFiConnection(unsigned long now) {
+  wl_status_t current_wifi_status = WiFi.status();
+  bool transitioned_to_connected = false;
+
+  if (current_wifi_status == WL_CONNECTED && s_wifi_connected_at == 0) {
+    s_wifi_connected_at = now;
+  }
+  if (!_wifi_status_initialized) {
+    _last_wifi_status = current_wifi_status;
+    _wifi_status_initialized = true;
+  }
+  if (now - _last_wifi_check <= 10000) {
+    return false;
+  }
+  _last_wifi_check = now;
+
+  if (current_wifi_status == WL_CONNECTED) {
+    if (_last_wifi_status != WL_CONNECTED) {
+      transitioned_to_connected = true;
+      _wifi_disconnected_time = 0;
+      s_wifi_connected_at = now;
+      _wifi_reconnect_backoff_attempt = 0;
+      #ifdef ESP_PLATFORM
+      wifi_ps_type_t ps_mode;
+      uint8_t ps_pref = _prefs->wifi_power_save;
+      if (ps_pref == 1) {
+        ps_mode = WIFI_PS_NONE;
+      } else if (ps_pref == 2) {
+        ps_mode = WIFI_PS_MAX_MODEM;
+      } else {
+        ps_mode = WIFI_PS_MIN_MODEM;
+      }
+      esp_wifi_set_ps(ps_mode);
+      #ifdef MQTT_WIFI_TX_POWER
+      WiFi.setTxPower(MQTT_WIFI_TX_POWER);
+      #else
+      WiFi.setTxPower(WIFI_POWER_11dBm);
+      #endif
+      #endif
+    }
+    if (s_wifi_connected_at == 0) {
+      s_wifi_connected_at = now;
+    }
+    _last_wifi_status = WL_CONNECTED;
+  } else {
+    if (_last_wifi_status == WL_CONNECTED) {
+      _wifi_disconnected_time = now;
+      s_wifi_connected_at = 0;
+      if (_analyzer_us_client) {
+        _analyzer_us_client->disconnect();
+      }
+      if (_analyzer_eu_client) {
+        _analyzer_eu_client->disconnect();
+      }
+    } else if (_wifi_disconnected_time > 0) {
+      unsigned long disconnected_duration = now - _wifi_disconnected_time;
+      static const unsigned long WIFI_BACKOFF_MS[] = { 15000, 30000, 60000, 120000, 300000 };
+      unsigned int idx = (_wifi_reconnect_backoff_attempt < 5) ? _wifi_reconnect_backoff_attempt : 4;
+      unsigned long delay_ms = WIFI_BACKOFF_MS[idx];
+      unsigned long elapsed_since_attempt = (now >= _last_wifi_reconnect_attempt)
+          ? (now - _last_wifi_reconnect_attempt)
+          : (ULONG_MAX - _last_wifi_reconnect_attempt + now + 1);
+      if (disconnected_duration >= delay_ms && elapsed_since_attempt >= delay_ms) {
+        _last_wifi_reconnect_attempt = now;
+        if (_wifi_reconnect_backoff_attempt < 5) {
+          _wifi_reconnect_backoff_attempt++;
+        }
+        WiFi.disconnect();
+        WiFi.begin(_prefs->wifi_ssid, _prefs->wifi_password);
+      }
+    }
+    _last_wifi_status = current_wifi_status;
+  }
+  return transitioned_to_connected;
+}
+
 bool MQTTBridge::isReady() const {
   return _initialized && isWiFiConfigValid(_prefs);
 }
@@ -937,77 +945,15 @@ void MQTTBridge::loop() {
   // This method is kept for API compatibility but does nothing
   return;
   #else
-  // Non-ESP32: Original loop implementation
-  // Actively monitor and manage WiFi connection
-  static unsigned long last_wifi_check = 0;
-  static unsigned long last_wifi_reconnect_attempt = 0;
-  static wl_status_t last_wifi_status = WL_DISCONNECTED;
-  static bool wifi_status_initialized = false;
-  static unsigned long wifi_disconnected_time = 0;
-  
+  // Non-ESP32: loop() drives WiFi and MQTT (same logic as mqttTaskLoop via handleWiFiConnection)
   unsigned long now = millis();
-  wl_status_t current_wifi_status = WiFi.status();
-  
-  if (current_wifi_status == WL_CONNECTED && s_wifi_connected_at == 0) {
-    s_wifi_connected_at = millis();
+  if (handleWiFiConnection(now) && !_ntp_synced) {
+    syncTimeWithNTP();
   }
-  
-  // Initialize last_wifi_status on first loop() call
-  if (!wifi_status_initialized) {
-    last_wifi_status = current_wifi_status;
-    wifi_status_initialized = true;
-    if (current_wifi_status == WL_CONNECTED && !_ntp_synced) {
-      syncTimeWithNTP();
-    }
-  }
-  
-  // Check WiFi status every 10 seconds for faster detection
-  if (now - last_wifi_check > 10000) {
-    last_wifi_check = now;
-    
-    if (current_wifi_status == WL_CONNECTED) {
-      if (last_wifi_status != WL_CONNECTED) {
-        wifi_disconnected_time = 0;
-        s_wifi_connected_at = millis();
-        if (!_ntp_synced) {
-          syncTimeWithNTP();
-        }
-      }
-      if (s_wifi_connected_at == 0) {
-        s_wifi_connected_at = millis();
-      }
-      last_wifi_status = WL_CONNECTED;
-    } else {
-      if (last_wifi_status == WL_CONNECTED) {
-        wifi_disconnected_time = now;
-        s_wifi_connected_at = 0;
-        // Explicitly stop analyzer MQTT clients so ESP-IDF frees their buffers (it does not free on WiFi drop)
-        if (_analyzer_us_client) {
-          _analyzer_us_client->disconnect();
-        }
-        if (_analyzer_eu_client) {
-          _analyzer_eu_client->disconnect();
-        }
-      } else if (wifi_disconnected_time > 0) {
-        unsigned long disconnected_duration = now - wifi_disconnected_time;
-        
-        // Try to force reconnection if disconnected for more than 30 seconds
-        if (disconnected_duration > 30000 && (now - last_wifi_reconnect_attempt) > 30000) {
-          last_wifi_reconnect_attempt = now;
-          WiFi.disconnect();
-          WiFi.begin(_prefs->wifi_ssid, _prefs->wifi_password);
-        }
-      }
-      last_wifi_status = current_wifi_status;
-    }
-  }
-  
-  // Check for pending NTP sync (triggered from WiFi event handler)
   if (_ntp_sync_pending && WiFi.status() == WL_CONNECTED) {
     _ntp_sync_pending = false;
     syncTimeWithNTP();
   }
-  
   // Check if analyzer server settings have changed in preferences
   static unsigned long last_analyzer_check = 0;
   if (millis() - last_analyzer_check > 5000) {
@@ -1129,7 +1075,6 @@ void MQTTBridge::loop() {
   #ifdef ESP_PLATFORM
   // Critical memory check (every 15 minutes) - log warnings and optionally recover from fragmentation
   static unsigned long last_critical_check = 0;
-  static unsigned long last_fragmentation_recovery = 0;
   unsigned long now_crit = millis();
   if (now_crit - last_critical_check > 900000) {
     size_t free_h = ESP.getFreeHeap();
@@ -1151,8 +1096,8 @@ void MQTTBridge::loop() {
     }
     // Proactive fragmentation recovery: if max_alloc collapsed (e.g. after poor WiFi then reconnect),
     // recreate MQTT clients so they allocate fresh blocks. Throttle to once per 5 minutes.
-    if (max_alloc < 58000 && (now_crit - last_fragmentation_recovery) > 300000) {
-      last_fragmentation_recovery = now_crit;
+    if (max_alloc < 58000 && (now_crit - _last_fragmentation_recovery) > 300000) {
+      _last_fragmentation_recovery = now_crit;
       MQTT_DEBUG_PRINTLN("Fragmentation recovery: recreating MQTT clients (max_alloc=%d)", (int)max_alloc);
       recreateMqttClientsForFragmentationRecovery();
     }
@@ -1221,6 +1166,7 @@ void MQTTBridge::ensureMainMqttClient() {
   optimizeMqttClientConfig(_mqtt_client, false);
   _mqtt_client->onConnect([this](bool sessionPresent) {
     MQTT_DEBUG_PRINTLN("MQTT broker connected");
+    _main_broker_reconnect_backoff_attempt = 0;
     for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
       if (_brokers[i].enabled && !_brokers[i].connected) {
         _brokers[i].connected = true;
@@ -1302,8 +1248,8 @@ void MQTTBridge::connectToBrokers() {
     return;
   }
   
-  // Throttle main broker reconnection to avoid rapid connect/disconnect loops when signal is flaky
-  static const unsigned long MAIN_BROKER_RECONNECT_THROTTLE_MS = 30000;
+  // Main broker reconnect uses exponential backoff: 15s, 30s, 60s, 120s, 300s (reset on connect)
+  static const unsigned long MAIN_BROKER_BACKOFF_MS[] = { 15000, 30000, 60000, 120000, 300000 };
 
   // For now, connect to the first enabled broker
   // TODO: Implement multi-broker support with PsychicMqttClient
@@ -1313,7 +1259,7 @@ void MQTTBridge::connectToBrokers() {
     // Only call connect() once for initial connection.
     // After that, ESP-IDF's auto-reconnect handles reconnection automatically.
     // If we forced disconnect (e.g. on publish failure), we must call connect() again
-    // since disconnect() stops the client; throttle to avoid reconnect storms when signal is bad.
+    // since disconnect() stops the client; use exponential backoff to avoid reconnect storms.
     if (!_brokers[i].initial_connect_done) {
       MQTT_DEBUG_PRINTLN("Initial connection to broker %d: %s:%d", i, _brokers[i].host, _brokers[i].port);
 
@@ -1335,13 +1281,14 @@ void MQTTBridge::connectToBrokers() {
       _brokers[i].last_attempt = millis();
       MQTT_DEBUG_PRINTLN("Initiated connection to broker %d (auto-reconnect will handle future reconnections)", i);
     } else if (_mqtt_client && !_mqtt_client->connected()) {
-      // Main broker was stopped (e.g. after forced disconnect on publish failure). Reconnect with throttle.
       unsigned long now = millis();
       unsigned long reconnect_elapsed = (_brokers[i].last_attempt <= now)
           ? (now - _brokers[i].last_attempt)
           : (ULONG_MAX - _brokers[i].last_attempt + now + 1);
-      if (reconnect_elapsed >= MAIN_BROKER_RECONNECT_THROTTLE_MS) {
-        MQTT_DEBUG_PRINTLN("Reconnecting to broker %d: %s:%d (throttled)", i, _brokers[i].host, _brokers[i].port);
+      unsigned int idx = (_main_broker_reconnect_backoff_attempt < 5) ? _main_broker_reconnect_backoff_attempt : 4;
+      unsigned long delay_ms = MAIN_BROKER_BACKOFF_MS[idx];
+      if (reconnect_elapsed >= delay_ms) {
+        MQTT_DEBUG_PRINTLN("Reconnecting to broker %d: %s:%d (backoff)", i, _brokers[i].host, _brokers[i].port);
         char broker_uri[128];
         snprintf(broker_uri, sizeof(broker_uri), "mqtt://%s:%d", _brokers[i].host, _brokers[i].port);
         _mqtt_client->setServer(broker_uri);
@@ -1350,6 +1297,9 @@ void MQTTBridge::connectToBrokers() {
         }
         _mqtt_client->connect();
         _brokers[i].last_attempt = now;
+        if (_main_broker_reconnect_backoff_attempt < 5) {
+          _main_broker_reconnect_backoff_attempt++;
+        }
       }
     }
 
@@ -1498,24 +1448,9 @@ bool MQTTBridge::publishStatus() {
     return false;
   }
   
-  // Memory pressure check: Use same threshold as packet publishes for consistency
-  // Status publishes should not be skipped more aggressively than packets
-  #ifdef ESP32
-  unsigned long now = millis();
-  if (now - _last_memory_check > 5000) {  // Check every 5 seconds
-    size_t max_alloc = ESP.getMaxAllocHeap();
-    if (max_alloc < 60000) {  // Less than 60KB max alloc = severe fragmentation (same as packets)
-      static unsigned long last_status_skip_log = 0;
-      if (now - last_status_skip_log > 300000) {  // Log every 5 minutes
-        MQTT_DEBUG_PRINTLN("MQTT: Skipping status publish due to memory pressure (Max alloc: %d)", max_alloc);
-        last_status_skip_log = now;
-      }
-      return false;  // Skip status publish
-    }
-    _last_memory_check = now;
-  }
-  #endif
-  
+  // Allow status publish even when max_alloc is low; buffer is PSRAM, so attempt may succeed.
+  // Recovery can be triggered after a successful publish (see task loop).
+
   // Use cached destination status to avoid redundant checks
   // Note: Connection state is verified in connectToBrokers() which runs before publishStatus()
   bool has_custom_brokers = _cached_has_brokers && _config_valid;
@@ -2671,12 +2606,15 @@ void MQTTBridge::maintainAnalyzerConnections() {
   const unsigned long RENEWAL_BUFFER = 60; // Renew tokens 60 seconds before expiration (minimal buffer to avoid downtime)
   const unsigned long DISCONNECT_THRESHOLD = 60; // Only disconnect if token expires within 60 seconds
   const unsigned long RENEWAL_THROTTLE_MS = 60000; // Don't attempt renewal more than once per minute
-  const unsigned long RECONNECT_THROTTLE_MS = 60000; // Don't attempt reconnection more than once per minute
+  static const unsigned long ANALYZER_BACKOFF_MS[] = { 60000, 120000, 240000, 300000 }; // 1min, 2min, 4min, 5min cap
   
   unsigned long now_millis = millis();
   
   // Check and renew US server token if needed
   if (_analyzer_us_enabled && _analyzer_us_client) {
+    if (_analyzer_us_client->connected()) {
+      _analyzer_us_reconnect_backoff_attempt = 0;
+    }
     // Check if token is expired or will expire soon
     // Only check expiration if time is synced - if time isn't synced, we can't validate expiration
     // If time wasn't synced when token was created, expiration time will be invalid (< 1000000000), so renew when time syncs
@@ -2761,20 +2699,23 @@ void MQTTBridge::maintainAnalyzerConnections() {
       unsigned long reconnect_elapsed = (now_millis >= _last_reconnect_attempt_us) ?
                                       (now_millis - _last_reconnect_attempt_us) :
                                       (ULONG_MAX - _last_reconnect_attempt_us + now_millis + 1);
-      if (reconnect_elapsed >= RECONNECT_THROTTLE_MS) {
+      unsigned int idx = (_analyzer_us_reconnect_backoff_attempt < 4) ? _analyzer_us_reconnect_backoff_attempt : 3;
+      unsigned long delay_ms = ANALYZER_BACKOFF_MS[idx];
+      if (reconnect_elapsed >= delay_ms) {
         _last_reconnect_attempt_us = now_millis;
-        _analyzer_us_client->connect();
-      } else {
-        static unsigned long last_throttle_log_us = 0;
-        if (now_millis - last_throttle_log_us > 300000) {
-          last_throttle_log_us = now_millis;
+        if (_analyzer_us_reconnect_backoff_attempt < 4) {
+          _analyzer_us_reconnect_backoff_attempt++;
         }
+        _analyzer_us_client->connect();
       }
     }
   }
   
   // Check and renew EU server token if needed
   if (_analyzer_eu_enabled && _analyzer_eu_client) {
+    if (_analyzer_eu_client->connected()) {
+      _analyzer_eu_reconnect_backoff_attempt = 0;
+    }
     // Check if token is expired or will expire soon
     // Only check expiration if time is synced - if time isn't synced, we can't validate expiration
     // If time wasn't synced when token was created, expiration time will be invalid (< 1000000000), so renew when time syncs
@@ -2859,8 +2800,13 @@ void MQTTBridge::maintainAnalyzerConnections() {
       unsigned long reconnect_elapsed = (now_millis >= _last_reconnect_attempt_eu) ?
                                       (now_millis - _last_reconnect_attempt_eu) :
                                       (ULONG_MAX - _last_reconnect_attempt_eu + now_millis + 1);
-      if (reconnect_elapsed >= RECONNECT_THROTTLE_MS) {
+      unsigned int idx = (_analyzer_eu_reconnect_backoff_attempt < 4) ? _analyzer_eu_reconnect_backoff_attempt : 3;
+      unsigned long delay_ms = ANALYZER_BACKOFF_MS[idx];
+      if (reconnect_elapsed >= delay_ms) {
         _last_reconnect_attempt_eu = now_millis;
+        if (_analyzer_eu_reconnect_backoff_attempt < 4) {
+          _analyzer_eu_reconnect_backoff_attempt++;
+        }
         _analyzer_eu_client->connect();
       }
     }
@@ -3169,23 +3115,20 @@ void MQTTBridge::getClientVersion(char* buffer, size_t buffer_size) const {
 void MQTTBridge::optimizeMqttClientConfig(PsychicMqttClient* client, bool is_analyzer_client) {
   if (!client) return;
   
-  // Buffer size selection (optimized for memory):
-  // - Analyzer clients: Need 896 bytes for CONNECT message with 768-byte JWT tokens
-  //   (CONNECT message: ~10 bytes overhead + 70 bytes username + 768 bytes password = ~850 bytes)
-  //   Reduced from 1024 to 896 (128 bytes saved) - still safe with ~46 bytes headroom
-  // - Main client: Can use 640 bytes (smaller than default 768, but safe for regular publishes)
-  //   Most JSON messages are <500 bytes, CONNECT messages are smaller without JWT tokens
-  //   Reduced from 768 to 640 (128 bytes saved) - still safe with ~140 bytes headroom
-  int buffer_size = is_analyzer_client ? 896 : 640;
+  // Use a single buffer size for all clients to reduce heap fragmentation: mixed sizes
+  // (e.g. 640 vs 896) create different-sized holes that are harder to reuse on reconnect.
+  // 896 is the minimum safe size for analyzer clients (CONNECT + 768-byte JWT); main
+  // client uses the same size so all MQTT buffer allocations are identical.
+  static const int MQTT_CLIENT_BUFFER_SIZE = 896;
   
-  client->setBufferSize(buffer_size);
+  client->setBufferSize(MQTT_CLIENT_BUFFER_SIZE);
   
   // Access ESP-IDF config to optimize additional settings
   esp_mqtt_client_config_t* config = client->getMqttConfig();
   if (config) {
     #if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
-      if (config->buffer.out_size == 0 || config->buffer.out_size > buffer_size) {
-        config->buffer.out_size = buffer_size;
+      if (config->buffer.out_size == 0 || config->buffer.out_size > MQTT_CLIENT_BUFFER_SIZE) {
+        config->buffer.out_size = MQTT_CLIENT_BUFFER_SIZE;
       }
     #endif
   }

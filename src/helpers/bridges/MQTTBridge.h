@@ -157,6 +157,7 @@ private:
   // Memory pressure monitoring
   unsigned long _last_memory_check;
   int _skipped_publishes;  // Count of skipped publishes due to memory pressure
+  unsigned long _last_fragmentation_recovery;  // Throttle: 5 min between recovery runs (task + loop)
   unsigned long _last_token_renewal_attempt_us;
   unsigned long _last_token_renewal_attempt_eu;
   unsigned long _last_reconnect_attempt_us;
@@ -190,6 +191,19 @@ private:
   static const unsigned long ANALYZER_LOG_INTERVAL = 30000; // Log every 30 seconds max
   unsigned long _last_config_warning; // Throttle configuration mismatch warnings
   static const unsigned long CONFIG_WARNING_INTERVAL = 300000; // Log every 5 minutes max
+
+  // WiFi connection state and exponential backoff (one place for mqttTaskLoop + loop())
+  unsigned long _last_wifi_check;
+  wl_status_t _last_wifi_status;
+  bool _wifi_status_initialized;
+  unsigned long _wifi_disconnected_time;  // 0 when connected
+  unsigned long _last_wifi_reconnect_attempt;
+  uint8_t _wifi_reconnect_backoff_attempt;  // 0..5 → 15s, 30s, 60s, 120s, 300s; reset on connect
+  // Main broker reconnect backoff (reset in onConnect)
+  uint8_t _main_broker_reconnect_backoff_attempt;  // 0..5 → 15s, 30s, 60s, 120s, 300s
+  // Analyzer reconnect backoff (reset when that client is connected)
+  uint8_t _analyzer_us_reconnect_backoff_attempt;  // 0..4 → 60s, 120s, 240s, 300000
+  uint8_t _analyzer_eu_reconnect_backoff_attempt;
   
   // Optional pointers for collecting stats internally (set by mesh if available)
   mesh::Dispatcher* _dispatcher;  // For air times and errors
@@ -203,6 +217,9 @@ private:
   void connectToBrokers();
   void processPacketQueue();
   bool publishStatus();  // Returns true if status was successfully published
+  // Single place for WiFi monitoring: disconnect analyzers on drop, force reconnect with exponential backoff.
+  // Returns true if we transitioned to connected this call (e.g. for NTP sync in loop()).
+  bool handleWiFiConnection(unsigned long now);
   
   // FreeRTOS task function (runs on Core 0)
   #ifdef ESP_PLATFORM
