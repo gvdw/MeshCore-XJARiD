@@ -158,6 +158,8 @@ private:
   unsigned long _last_memory_check;
   int _skipped_publishes;  // Count of skipped publishes due to memory pressure
   unsigned long _last_fragmentation_recovery;  // Throttle: 5 min between recovery runs (task + loop)
+  unsigned long _fragmentation_pressure_since;  // 0 = not under pressure; else first time max_alloc < threshold
+  unsigned long _last_critical_check_run;  // Throttle: run unified check at most every 60s
   unsigned long _last_token_renewal_attempt_us;
   unsigned long _last_token_renewal_attempt_eu;
   unsigned long _last_reconnect_attempt_us;
@@ -213,6 +215,9 @@ private:
   
   // Internal methods
   void ensureMainMqttClient();  // Create main MQTT client if _config_valid and _mqtt_client is null (e.g. after reinit)
+  #ifdef ESP_PLATFORM
+  void runCriticalMemoryCheckAndRecovery();  // Unified heap check, pressure timer, optional recovery
+  #endif
   void recreateMqttClientsForFragmentationRecovery();  // Disconnect, delete, recreate all MQTT clients to recover max_alloc
   void connectToBrokers();
   void processPacketQueue();
