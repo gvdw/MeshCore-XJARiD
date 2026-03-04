@@ -53,13 +53,12 @@ This document identifies issues in the MQTT codebase that could cause connection
 - **Status**: Acceptable - only happens once per hour, has internal timeout
 - **Recommendation**: Consider making NTP sync fully async if responsiveness becomes an issue
 
-### 6. **vTaskDelay in Packet Processing** ⚠️ ACCEPTABLE
+### 6. **Packet Processing Yield Strategy** ✅ UPDATED
 
-- **Location**: `processPacketQueue()` line 833
-- **Issue**: `vTaskDelay(1)` yields for ~10ms on ESP32 after each packet
-- **Impact**: Adds latency to packet processing
-- **Status**: Acceptable - prevents blocking, maintains responsiveness
-- **Note**: This is intentional to yield to other tasks
+- **Location**: `processPacketQueue()`
+- **Current Behavior**: No per-packet `vTaskDelay(1)` inside queue processing loop
+- **Impact**: Lower per-packet latency while still yielding once per task loop cycle
+- **Status**: Improved from previous revision
 
 ### 7. **Connection State Race Conditions** ⚠️ POTENTIAL
 

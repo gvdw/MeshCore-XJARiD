@@ -20,9 +20,9 @@ This document outlines the responsiveness issues identified in the MQTT implemen
 
 ### 3. **Memory Usage**
 
-- **Issue**: Large stack allocations (2048 byte buffers) and unconditional raw data storage
+- **Issue**: Large stack allocations (2048 byte buffers) and always-on raw data capture when bridge is enabled (current behavior)
 - **Impact**: Increased stack pressure, unnecessary memory usage
-- **Fix**: Reduced default buffer sizes, conditional raw data storage
+- **Fix**: Moved packet JSON allocation to PSRAM-first with stack fallback; raw capture currently occurs whenever bridge is enabled
 
 ### 4. **WiFi Reconnection Frequency**
 
@@ -59,8 +59,8 @@ WiFi.begin(...);
 
 ### 3. Memory Optimizations
 
-- **Default JSON buffer**: 1024 → 512 bytes (for small packets)
-- **Raw data storage**: Only when `_packets_enabled` is true
+- **Packet JSON allocation**: PSRAM-first 2048-byte buffers with stack fallback (1024/2048)
+- **Raw data capture**: currently when bridge is enabled (independent of `mqtt.packets`)
 - **Early queue checks**: Drop packets immediately if queue is full
 
 ### 4. Reduced WiFi Overhead
@@ -86,7 +86,7 @@ WiFi.begin(...);
 
 ### 2. JSON Buffer Stack Usage
 
-- **Status**: Acceptable - 2048 bytes on stack is reasonable for ESP32 (8KB+ stack)
+- **Status**: Stack pressure is reduced by PSRAM-first allocation; fallback stack buffers remain for low-memory conditions
 - **Note**: Stack allocation is faster than heap allocation and doesn't fragment memory
 
 ### 3. Packet Queue Size
@@ -129,7 +129,7 @@ WiFi.begin(...);
 3. **MQTT Throughput**: Verify packets are still published correctly with:
    - Reduced processing limits
    - Smaller buffers
-   - Conditional raw data storage
+   - raw data capture occurs when bridge is enabled (not currently gated by mqtt.packets)
 
 ## Code Changes Summary
 
@@ -141,7 +141,7 @@ WiFi.begin(...);
   - Optimized WiFi reconnection
   - Added early exit conditions
   - Removed debug logging from hot paths
-  - Conditional raw data storage
+  - raw data capture occurs when bridge is enabled (not currently gated by mqtt.packets)
   - Optimized topic building
 
 - `src/helpers/MQTTMessageBuilder.cpp`

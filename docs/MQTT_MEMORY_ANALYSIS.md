@@ -55,6 +55,7 @@
    - **Impact**: Minimal (only on connection, not per publish)
 
 4. **publish() Calls** ⚠️ **CONFIRMED MAIN CULPRIT**
+
    ```cpp
    // From PsychicMqttClient.cpp line 370-389
    int publish(const char *topic, int qos, bool retain, const char *payload, int length, bool async)
@@ -144,7 +145,7 @@ Since the library is external, we need to:
 
 #### C. Throttle Publishes (Already Implemented) ✅
 
-- **Current**: Skip publishes when Max alloc < 60KB
+- **Current**: Skip publishes using adaptive max-alloc thresholds derived from internal heap size
 - **Status**: ✅ Implemented
 - **Effect**: Prevents further fragmentation when memory is low
 
@@ -158,7 +159,7 @@ Since the library is external, we need to:
 
 #### E. Reduce Buffer Size Configuration
 
-- **Current**: Default buffer size is 1024 bytes (from `setBufferSize()`)
+- **Current**: MQTT client buffer size is unified to 896 bytes (`setBufferSize(896)`)
 - **Option**: Reduce buffer size if messages are smaller
 - **Impact**: Less memory per client instance
 - **Note**: May cause message fragmentation if payloads exceed buffer
@@ -211,12 +212,12 @@ Consider lightweight MQTT libraries with better memory management:
    - Or `coreMQTT` (fixed buffers)
    - Requires significant refactoring
 
-## Current Mitigations
+## Current Mitigations (Current Branch)
 
-✅ **Memory Pressure Monitoring**: Skip publishes when fragmented
+✅ **Adaptive Memory Pressure Monitoring**: Skip publishes based on dynamic max-alloc thresholds
 ✅ **setServer() Optimization**: Only call when URI changes  
 ✅ **JSON Buffer Reuse**: Build once, publish to multiple destinations
-✅ **Analyzer Server Throttling**: Skip when memory low
+✅ **Analyzer Server Throttling**: Analyzer publishes are gated by adaptive memory checks
 
 ## Remaining Risk
 

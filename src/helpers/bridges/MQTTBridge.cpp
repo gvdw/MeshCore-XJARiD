@@ -518,7 +518,7 @@ void MQTTBridge::begin() {
   #define MQTT_TASK_CORE 0
   #endif
   #ifndef MQTT_TASK_STACK_SIZE
-  #define MQTT_TASK_STACK_SIZE 12288  // 12KB default: safer for JWT + TLS + WebSocket path on ESP32-S3
+  #define MQTT_TASK_STACK_SIZE 16384  // 16KB default: extra headroom for multi-broker JWT + TLS + WebSocket workloads
   #endif
   #ifndef MQTT_TASK_PRIORITY
   #define MQTT_TASK_PRIORITY 1
@@ -874,16 +874,7 @@ void MQTTBridge::mqttTaskLoop() {
           if (publishStatus()) {
             _last_status_publish = now;
             _last_status_retry = 0;
-            MQTT_DEBUG_PRINTLN("Status published successfully, next publish in %lu ms", _status_interval);
-            // If we're in the hole but just proved connectivity, recover sooner than the dedicated pressure timer
-            size_t max_alloc = ESP.getMaxAllocHeap();
-            if (max_alloc < 58000 && (now - _last_fragmentation_recovery) > 300000) {
-              _last_fragmentation_recovery = now;
-              _fragmentation_pressure_since = 0;  // Reset pressure timer so dedicated check doesn't fire again soon
-              MQTT_DEBUG_PRINTLN("Fragmentation recovery after status (max_alloc=%d)", (int)max_alloc);
-              recreateMqttClientsForFragmentationRecovery();
-            }
-          } else {
+            MQTT_DEBUG_PRINTLN("Status published successfully, next publish in %lu ms", _status_interval);          } else {
             MQTT_DEBUG_PRINTLN("Status publish failed, will retry in %lu ms", STATUS_RETRY_INTERVAL);
             // _last_status_retry already set above - will prevent immediate retry
           }
@@ -1786,7 +1777,7 @@ bool MQTTBridge::publishStatus() {
               // Share the same broker URI tracking as packet publishes to avoid sync issues
               // Track last broker URI to avoid calling setServer() unnecessarily (memory optimization)
               // setServer() may allocate memory, so we only call it when the broker changes
-              static char last_broker_uri_shared[128] = "";
+              static char last_broker_uri_shared[192] = "";
               
               for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
                 // Verify broker is actually connected (state might be stale)
@@ -1803,17 +1794,12 @@ bool MQTTBridge::publishStatus() {
                   }
                   
                   // Build broker URI
-                  char broker_uri[128];
-                  snprintf(broker_uri, sizeof(broker_uri), "mqtt://%s:%d", _brokers[i].host, _brokers[i].port);
+                  char broker_uri[192];
+                  buildBrokerUri(_brokers[i].host, _brokers[i].port, broker_uri, sizeof(broker_uri));
                   
                   // Only call setServer() if broker URI changed (reduces memory allocations)
                   if (strcmp(broker_uri, last_broker_uri_shared) != 0) {
                     _mqtt_client->setServer(broker_uri);
-
-#ifdef MQTT_CUSTOM_CA_ISRG_ROOT_X1
-      _mqtt_client->setCACert(ISRG_ROOT_X1);
-      MQTT_DEBUG_PRINTLN("Custom broker TLS CA: ISRG Root X1");
-#endif
                     strncpy(last_broker_uri_shared, broker_uri, sizeof(last_broker_uri_shared) - 1);
                     last_broker_uri_shared[sizeof(last_broker_uri_shared) - 1] = '\0';
                   }
@@ -1984,23 +1970,18 @@ void MQTTBridge::publishPacket(mesh::Packet* packet, bool is_tx,
     if (_config_valid && _mqtt_client && _mqtt_client->connected()) {
       // Track last broker URI to avoid calling setServer() unnecessarily (memory optimization)
       // setServer() may allocate memory, so we only call it when the broker changes
-      static char last_broker_uri[128] = "";
+      static char last_broker_uri[192] = "";
       
       for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
         // Verify broker is actually connected (state might be stale)
         if (_brokers[i].enabled && _brokers[i].connected && _mqtt_client->connected()) {
           // Build broker URI
-          char broker_uri[128];
-          snprintf(broker_uri, sizeof(broker_uri), "mqtt://%s:%d", _brokers[i].host, _brokers[i].port);
+          char broker_uri[192];
+                  buildBrokerUri(_brokers[i].host, _brokers[i].port, broker_uri, sizeof(broker_uri));
           
           // Only call setServer() if broker URI changed (reduces memory allocations)
           if (strcmp(broker_uri, last_broker_uri) != 0) {
             _mqtt_client->setServer(broker_uri);
-
-#ifdef MQTT_CUSTOM_CA_ISRG_ROOT_X1
-      _mqtt_client->setCACert(ISRG_ROOT_X1);
-      MQTT_DEBUG_PRINTLN("Custom broker TLS CA: ISRG Root X1");
-#endif
             strncpy(last_broker_uri, broker_uri, sizeof(last_broker_uri) - 1);
             last_broker_uri[sizeof(last_broker_uri) - 1] = '\0';
           }
@@ -2115,23 +2096,18 @@ void MQTTBridge::publishRaw(mesh::Packet* packet) {
     if (_config_valid && _mqtt_client && _mqtt_client->connected()) {
       // Track last broker URI to avoid calling setServer() unnecessarily (memory optimization)
       // setServer() may allocate memory, so we only call it when the broker changes
-      static char last_broker_uri_raw[128] = "";
+      static char last_broker_uri_raw[192] = "";
       
       for (int i = 0; i < MAX_MQTT_BROKERS_COUNT; i++) {
         // Verify broker is actually connected (state might be stale)
         if (_brokers[i].enabled && _brokers[i].connected && _mqtt_client->connected()) {
           // Build broker URI
-          char broker_uri[128];
-          snprintf(broker_uri, sizeof(broker_uri), "mqtt://%s:%d", _brokers[i].host, _brokers[i].port);
+          char broker_uri[192];
+                  buildBrokerUri(_brokers[i].host, _brokers[i].port, broker_uri, sizeof(broker_uri));
           
           // Only call setServer() if broker URI changed (reduces memory allocations)
           if (strcmp(broker_uri, last_broker_uri_raw) != 0) {
             _mqtt_client->setServer(broker_uri);
-
-#ifdef MQTT_CUSTOM_CA_ISRG_ROOT_X1
-      _mqtt_client->setCACert(ISRG_ROOT_X1);
-      MQTT_DEBUG_PRINTLN("Custom broker TLS CA: ISRG Root X1");
-#endif
             strncpy(last_broker_uri_raw, broker_uri, sizeof(last_broker_uri_raw) - 1);
             last_broker_uri_raw[sizeof(last_broker_uri_raw) - 1] = '\0';
           }
