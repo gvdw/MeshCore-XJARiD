@@ -142,6 +142,10 @@ static bool isWiFiConfigValid(const NodePrefs* prefs) {
 
 #ifdef WITH_MQTT_BRIDGE
 
+#ifndef MQTT_CLIENT_BUFFER_SIZE
+#define MQTT_CLIENT_BUFFER_SIZE 1024
+#endif
+
 // PSRAM-aware allocation: prefer PSRAM on ESP32 when BOARD_HAS_PSRAM, fallback to internal heap or malloc.
 // Use psram_free() for any pointer returned by psram_malloc().
 static void* psram_malloc(size_t size) {
@@ -520,7 +524,7 @@ void MQTTBridge::begin() {
   #define MQTT_TASK_CORE 0
   #endif
   #ifndef MQTT_TASK_STACK_SIZE
-  #define MQTT_TASK_STACK_SIZE 16384  // 16KB default: extra headroom for multi-broker JWT + TLS + WebSocket workloads
+  #define MQTT_TASK_STACK_SIZE 20480  // 20KB default: additional headroom for MQTT + TLS + WebSocket workloads
   #endif
   #ifndef MQTT_TASK_PRIORITY
   #define MQTT_TASK_PRIORITY 1
@@ -3374,11 +3378,9 @@ void MQTTBridge::optimizeMqttClientConfig(PsychicMqttClient* client, bool is_ana
   client->setKeepAlive(45);
   
   // Use a single buffer size for all clients to reduce heap fragmentation: mixed sizes
-  // (e.g. 640 vs 896) create different-sized holes that are harder to reuse on reconnect.
-  // 896 is the minimum safe size for analyzer clients (CONNECT + 768-byte JWT); main
-  // client uses the same size so all MQTT buffer allocations are identical.
-  static const int MQTT_CLIENT_BUFFER_SIZE = 896;
-  
+  // (e.g. 640 vs 1024) create different-sized holes that are harder to reuse on reconnect.
+  // 1024 provides extra headroom for analyzer clients (CONNECT + JWT) and main broker traffic;
+  // all clients use the same value so MQTT buffer allocations remain uniform.
   client->setBufferSize(MQTT_CLIENT_BUFFER_SIZE);
   
   // Access ESP-IDF config to optimize additional settings
