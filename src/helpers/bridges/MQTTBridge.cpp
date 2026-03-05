@@ -2452,6 +2452,7 @@ bool MQTTBridge::createAuthToken() {
       _token_us_expires_at = time_synced ? (current_time + expires_in) : 0;
     } else {
       MQTT_DEBUG_PRINTLN("Failed to create US token");
+      _auth_token_us[0] = '\0';
       _token_us_expires_at = 0;
     }
   }
@@ -2466,6 +2467,7 @@ bool MQTTBridge::createAuthToken() {
       _token_eu_expires_at = time_synced ? (current_time + expires_in) : 0;
     } else {
       MQTT_DEBUG_PRINTLN("Failed to create EU token");
+      _auth_token_eu[0] = '\0';
       _token_eu_expires_at = 0;
     }
   }
@@ -2821,9 +2823,10 @@ void MQTTBridge::maintainAnalyzerConnections() {
     return;
   }
   
-  // Create JWT tokens if they don't exist yet and conditions are met
-  if ((_analyzer_us_enabled || _analyzer_eu_enabled) && 
-      ((!_auth_token_us || strlen(_auth_token_us) == 0) && (!_auth_token_eu || strlen(_auth_token_eu) == 0))) {
+  // Create JWT tokens if any enabled analyzer is missing a token.
+  const bool us_token_missing = _analyzer_us_enabled && (!_auth_token_us || _auth_token_us[0] == '\0');
+  const bool eu_token_missing = _analyzer_eu_enabled && (!_auth_token_eu || _auth_token_eu[0] == '\0');
+  if (us_token_missing || eu_token_missing) {
     if (createAuthToken()) {
       if (_analyzer_us_enabled && _analyzer_us_client && _auth_token_us && strlen(_auth_token_us) > 0) {
         _analyzer_us_client->setCredentials(_analyzer_username, _auth_token_us);
@@ -2869,6 +2872,7 @@ void MQTTBridge::maintainAnalyzerConnections() {
     } else {
       // Time is synced - check if token needs renewal
       token_needs_renewal = (_token_us_expires_at == 0) || 
+                           (_auth_token_us == nullptr) || (_auth_token_us[0] == '\0') ||
                            !(_token_us_expires_at >= 1000000000) || // Expiration time invalid (created before time sync)
                            (current_time >= _token_us_expires_at) ||
                            (current_time >= (_token_us_expires_at - RENEWAL_BUFFER));
@@ -2936,6 +2940,7 @@ void MQTTBridge::maintainAnalyzerConnections() {
         }
       } else {
         MQTT_DEBUG_PRINTLN("Failed to renew US token");
+        if (_auth_token_us) _auth_token_us[0] = '\0';
         _token_us_expires_at = 0;
       }
     } else if (needs_reconnect) {
@@ -2970,6 +2975,7 @@ void MQTTBridge::maintainAnalyzerConnections() {
     } else {
       // Time is synced - check if token needs renewal
       token_needs_renewal = (_token_eu_expires_at == 0) || 
+                           (_auth_token_eu == nullptr) || (_auth_token_eu[0] == '\0') ||
                            !(_token_eu_expires_at >= 1000000000) || // Expiration time invalid (created before time sync)
                            (current_time >= _token_eu_expires_at) ||
                            (current_time >= (_token_eu_expires_at - RENEWAL_BUFFER));
@@ -3037,6 +3043,7 @@ void MQTTBridge::maintainAnalyzerConnections() {
         }
       } else {
         MQTT_DEBUG_PRINTLN("Failed to renew EU token");
+        if (_auth_token_eu) _auth_token_eu[0] = '\0';
         _token_eu_expires_at = 0;
       }
     } else if (needs_reconnect) {
